@@ -31,6 +31,7 @@ use crate::{
 		p2p::Client as P2pClient,
 		rpc::{Client as RpcClient, Event},
 	},
+	shutdown::Controller,
 	telemetry::{MetricCounter, MetricValue, Metrics},
 	types::{BlockVerified, ClientChannels, FatClientConfig},
 	utils::extract_kate,
@@ -147,7 +148,14 @@ pub async fn process_block(
 			let batch_rpc_fetched =
 				result.wrap_err(format!("Failed to fetch cells from node RPC at batch {i}"))?;
 
-			rpc_fetched.extend(batch_rpc_fetched.clone());
+			if let Err(e) = fat_client
+				.insert_cells_into_dht(block_number, batch_rpc_fetched.clone())
+				.await
+			{
+				debug!("Error inserting cells into DHT: {e}");
+			}
+
+			rpc_fetched.extend(batch_rpc_fetched);
 		}
 	}
 
@@ -183,13 +191,6 @@ pub async fn process_block(
 		warn!("No rows has been inserted into DHT since partition size is less than one row.")
 	}
 
-	if let Err(e) = fat_client
-		.insert_cells_into_dht(block_number, rpc_fetched)
-		.await
-	{
-		debug!("Error inserting cells into DHT: {e}");
-	}
-
 	Ok(())
 }
 
@@ -202,12 +203,14 @@ pub async fn process_block(
 /// * `metrics` -  Metrics registry
 /// * `channels` - Communitaction channels
 /// * `partition` - Assigned fat client partition
+/// * `shutdown` - Shutdown controller
 pub async fn run(
 	fat_client: impl FatClient,
 	cfg: FatClientConfig,
 	metrics: Arc<impl Metrics>,
 	mut channels: ClientChannels,
 	partition: Partition,
+	shutdown: Controller<String>,
 ) {
 	info!("Starting fat client...");
 
@@ -240,9 +243,7 @@ pub async fn run(
 			process_block(&fat_client, &metrics, &cfg, &header, received_at, partition).await
 		{
 			error!("Cannot process block: {error}");
-			if let Err(error) = channels.error_sender.send(error).await {
-				error!("Cannot send error message: {error}");
-			}
+			let _ = shutdown.trigger_shutdown(format!("Cannot process block: {error:#}"));
 			return;
 		};
 

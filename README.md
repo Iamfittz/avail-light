@@ -27,7 +27,7 @@
 
 Once the data is received, light client verifies individual cells and calculates the confidence, which is then stored locally.
 
-2. **App-Specific Mode**: If an **`App_ID` > 0** is given in the config file, the application client (part ot the light client) downloads all the relevant app data, reconstructs it and persists it locally. Reconstructed data is then available to accessed via an HTTP endpoint. (WIP)
+2. **App-Specific Mode**: If an **`App_ID` > 0** is given in the config file, the application client (part of the light client) downloads all the relevant app data, reconstructs it and persists it locally. Reconstructed data is then available to accessed via an HTTP endpoint. (WIP)
 
 3. **Fat-Client Mode**: The client retrieves larger contiguous chunks of the matrix on each block via RPC calls to an Avail node, and stores them on the DHT. This mode is activated when the `block_matrix_partition` parameter is set in the config file, and is mainly used with the `disable_proof_verification` flag because of the resource cost of cell validation.
    **IMPORTANT**: disabling proof verification introduces a trust assumption towards the node, that the data provided is correct.
@@ -118,7 +118,7 @@ full_node_ws = ["ws://127.0.0.1:9944"]
 app_id = 0
 confidence = 92.0
 avail_path = "avail_path"
-bootstraps = ["/ip4/127.0.0.1/tcp/39000/quic-v1/p2p/12D3KooWMm1c4pzeLPGkkCJMAgFbsfQ8xmVDusg272icWsaNHWzN"]
+bootstraps = ["/ip4/127.0.0.1/tcp/39000/p2p/12D3KooWMm1c4pzeLPGkkCJMAgFbsfQ8xmVDusg272icWsaNHWzN"]
 ```
 
 Full configuration reference can be found [below](#configuration-reference).
@@ -157,6 +157,7 @@ avail_secret_seed_phrase = "bottom drive obey lake curtain smoke basket hold rac
 
 - `--version`: Light Client version
 - `--clean`: Remove previous state dir set in `avail_path` config parameter
+- `--finality_sync_enable`: Enable finality sync
 
 ## Identity
 
@@ -179,28 +180,26 @@ secret_key = { seed={seed} }
 port = 37000
 # Configures AutoNAT behaviour to reject probes as a server for clients that are observed at a non-global ip address (default: false)
 autonat_only_global_ips = false
-# AutoNat throttle period for re-using a peer as server for a dial-request. (default: 1 sec)
+# AutoNat throttle period for re-using a peer as server for a dial-request. (default: 1s)
 autonat_throttle = 2
-# Interval in which the NAT status should be re-tried if it is currently unknown or max confidence was not reached yet. (default: 10 sec)
-autonat_retry_interval = 10
-# Interval in which the NAT should be tested again if max confidence was reached in a status. (default: 30 sec)
-autonat_refresh_interval = 30
-# AutoNat on init delay before starting the first probe. (default: 5 sec)
+# Interval in which the NAT status should be re-tried if it is currently unknown or max confidence was not reached yet. (default: 20s)
+autonat_retry_interval = 20
+# Interval in which the NAT should be tested again if max confidence was reached in a status. (default: 360s)
+autonat_refresh_interval = 360
+# AutoNat on init delay before starting the first probe. (default: 5s)
 autonat_boot_delay = 10
-# Sets application-specific version of the protocol family used by the peer. (default: "/avail_kad/id/1.0.0")
-identify_protocol = "/avail_kad/id/1.0.0"
-# Sets agent version that is sent to peers. (default: "avail-light-client/rust-client")
-identify_agent = "avail-light-client/rust-client"
 # Vector of Light Client bootstrap nodes, used to bootstrap the DHT (mandatory field).
-bootstraps = ["/ip4/13.51.79.255/udp/39000/quic-v1/12D3KooWE2xXc6C2JzeaCaEg7jvZLogWyjLsB5dA3iw5o3KcF9ds"]
+bootstraps = ["/ip4/13.51.79.255/tcp/39000/p2p/12D3KooWE2xXc6C2JzeaCaEg7jvZLogWyjLsB5dA3iw5o3KcF9ds"]
 # Vector of Relay nodes, which are used for hole punching
-relays = ["/ip4/13.49.44.246/udp/39111/quic-v1/12D3KooWBETtE42fN7DZ5QsGgi7qfrN3jeYdXmBPL4peVTDmgG9b"]
+relays = ["/ip4/13.49.44.246/tcp/39111/12D3KooWBETtE42fN7DZ5QsGgi7qfrN3jeYdXmBPL4peVTDmgG9b"]
 # WebSocket endpoint of a full node for subscribing to the latest header, etc (default: ws://127.0.0.1:9944).
 full_node_ws = ["ws://127.0.0.1:9944"]
+# Genesis hash of the network you are connecting to. The genesis hash will be checked upon connecting to the node(s) and will also be used to identify you on the p2p network. If you wish to skip the check for development purposes, entering DEV{suffix} instead will skip the check and create a separate p2p network with that identifier.
+genesis_hash = "DEV123"
 # ID of application used to start application client. If app_id is not set, or set to 0, application client is not started (default: 0).
 app_id = 0
-# Confidence threshold, used to calculate how many cells need to be sampled to achieve desired confidence (default: 92.0).
-confidence = 92.0
+# Confidence threshold, used to calculate how many cells need to be sampled to achieve desired confidence (default: 99.9).
+confidence = 99.9
 # File system path where RocksDB used by light client, stores its data. (default: avail_path)
 avail_path = "avail_path"
 # OpenTelemetry Collector endpoint (default: `http://127.0.0.1:4317`)
@@ -224,8 +223,8 @@ block_processing_delay = 0
 # Starting block of the syncing process. Omitting it will disable syncing. (default: None).
 sync_start_block = 0
 # Enable or disable synchronizing finality. If disabled, finality is assumed to be verified until the 
-# starting block at the point the LC is started and is only checked for new blocks. (default: true)
-sync_finality_enable = true
+# starting block at the point the LC is started and is only checked for new blocks. (default: false)
+sync_finality_enable = false
 # Time-to-live for DHT entries in seconds (default: 24h).
 # Default value is set for light clients. Due to the heavy duty nature of the fat clients, it is recommended to be set far below this value - not greater than 1hr.
 # Record TTL, publication and replication intervals are co-dependent: TTL >> publication_interval >> replication_interval.
@@ -238,13 +237,13 @@ publication_interval = 43200
 # Default value is set for light clients. Fat client value needs to be inferred from the TTL and publication interval values.
 # This interval should be significantly shorter than the publication interval, to ensure persistence between re-publications.
 replication_interval = 10800
-# The replication factor determines to how many closest peers a record is replicated. (default: 20).
-replication_factor = 20
+# The replication factor determines to how many closest peers a record is replicated. (default: 5).
+replication_factor = 5
 # Sets the amount of time to keep connections alive when they're idle. (default: 30s).
 # NOTE: libp2p default value is 10s, but because of Avail block time of 20s the value has been increased
 connection_idle_timeout = 30
-# Sets the timeout for a single Kademlia query. (default: 60s).
-query_timeout = 60
+# Sets the timeout for a single Kademlia query. (default: 10s).
+query_timeout = 10
 # Sets the allowed level of parallelism for iterative Kademlia queries. (default: 3).
 query_parallelism = 3
 # Sets the Kademlia caching strategy to use for successful lookups. If set to 0, caching is disabled. (default: 1).
@@ -252,11 +251,9 @@ caching_max_peers = 1
 # Require iterative queries to use disjoint paths for increased resiliency in the presence of potentially adversarial nodes. (default: false).
 disjoint_query_paths = false
 # The maximum number of records. (default: 2400000).
-# The default value has been calculated to sustain ~1hr worth of cells, in case of blocks with max sizes being produces in 20s block time for fat clients
-# (256x512) * 3 * 60
-max_kad_record_number = 2400000,
+max_kad_record_number = 2400000
 # The maximum size of record values, in bytes. (default: 8192).
-max_kad_record_size = 8192,
+max_kad_record_size = 8192
 # The maximum number of provider records for which the local node is the provider. (default: 1024).
 max_kad_provided_keys = 1024
 ```

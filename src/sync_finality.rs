@@ -2,7 +2,7 @@ use avail_subxt::primitives::Header;
 use codec::Encode;
 use color_eyre::{
 	eyre::{bail, eyre, Context},
-	Report, Result,
+	Result,
 };
 use futures::future::join_all;
 use rocksdb::DB;
@@ -12,14 +12,14 @@ use sp_core::{
 	twox_128, Pair, H256,
 };
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::Sender;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 use crate::{
 	data::{
 		get_finality_sync_checkpoint, store_block_header_in_db, store_finality_sync_checkpoint,
 	},
 	network::rpc::{self, WrappedProof},
+	shutdown::Controller,
 	types::{FinalitySyncCheckpoint, SignerMessage, State},
 	utils::filter_auth_set_changes,
 };
@@ -108,15 +108,13 @@ async fn get_valset_at_genesis(
 
 pub async fn run(
 	sync_finality_impl: impl SyncFinality,
-	error_sender: Sender<Report>,
+	shutdown: Controller<String>,
 	state: Arc<Mutex<State>>,
 	from_header: Header,
 ) {
-	if let Err(err) = sync_finality(sync_finality_impl, state, from_header).await {
-		error!("Cannot sync finality {err}");
-		if let Err(error) = error_sender.send(err).await {
-			error!("Cannot send error message: {error}");
-		}
+	if let Err(error) = sync_finality(sync_finality_impl, state, from_header).await {
+		error!("Cannot sync finality {error}");
+		let _ = shutdown.trigger_shutdown(format!("Cannot sync finality {error:#}"));
 	};
 }
 
@@ -212,24 +210,48 @@ pub async fn sync_finality(
 			&set_id,
 		));
 		// Verify all the signatures of the justification signs the hash of the block
-		let signer_addresses = proof
-			.0
-			.justification
-			.0
-			.commit
-			.precommits
-			.iter()
-			.map(|precommit| {
-				let is_ok = <ed25519::Pair as Pair>::verify(
-					&precommit.signature,
-					&signed_message,
-					&precommit.id,
-				);
-				is_ok
-					.then(|| precommit.clone().id)
-					.ok_or_else(|| eyre!("Not signed by this signature!"))
-			})
-			.collect::<Result<Vec<_>>>();
+		let signer_addresses =
+			proof
+				.0
+				.justification
+				.0
+				.commit
+				.precommits
+				.iter()
+				.map(|precommit| {
+					let mut is_ok = <ed25519::Pair as Pair>::verify(
+						&precommit.signature,
+						&signed_message,
+						&precommit.id,
+					);
+					if !is_ok {
+						warn!("Signature verification fails with default set_id {}, trying alternatives.", set_id);
+						for set_id_m in (set_id - 10)..(set_id + 10) {
+							let s_m = Encode::encode(&(
+								&SignerMessage::PrecommitMessage(
+									proof.0.justification.0.commit.precommits[0]
+										.clone()
+										.precommit,
+								),
+								&proof.0.justification.0.round,
+								&set_id_m,
+							));
+							is_ok = <ed25519::Pair as Pair>::verify(
+								&precommit.signature,
+								&s_m,
+								&precommit.id,
+							);
+							if is_ok {
+								info!("Signature match with set_id={set_id_m}");
+								break;
+							}
+						}
+					}
+					is_ok
+						.then(|| precommit.clone().id)
+						.ok_or_else(|| eyre!("Not signed by this signature!"))
+				})
+				.collect::<Result<Vec<_>>>();
 
 		let Ok(signer_addresses) = signer_addresses else {
 			error!("Verification failed!");

@@ -1,12 +1,11 @@
 use allow_block_list::BlockedPeers;
 use color_eyre::{eyre::WrapErr, Report, Result};
-use kad_mem_store::{MemoryStore, MemoryStoreConfig};
 use libp2p::{
 	autonat, dcutr, identify, identity,
 	kad::{self, PeerRecord, QueryId},
 	mdns, noise, ping, relay,
 	swarm::NetworkBehaviour,
-	tcp, upnp, yamux, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+	tcp, upnp, yamux, PeerId, Swarm, SwarmBuilder,
 };
 use multihash::{self, Hasher};
 use std::collections::HashMap;
@@ -14,7 +13,6 @@ use tokio::sync::{
 	mpsc::{self},
 	oneshot,
 };
-use tracing::info;
 
 #[cfg(feature = "network-analysis")]
 pub mod analyzer;
@@ -22,14 +20,12 @@ mod client;
 mod event_loop;
 mod kad_mem_store;
 
-use crate::{
-	network::p2p::event_loop::IdentityData,
-	types::{KademliaMode, LibP2PConfig, SecretKey},
-};
+use crate::types::{LibP2PConfig, SecretKey};
 pub use client::Client;
-use event_loop::EventLoop;
+pub use event_loop::EventLoop;
+pub use kad_mem_store::MemoryStoreConfig;
 
-use self::client::BlockStat;
+use self::{client::BlockStat, kad_mem_store::MemoryStore};
 use libp2p_allow_block_list as allow_block_list;
 
 #[derive(Debug)]
@@ -89,8 +85,8 @@ pub trait Command {
 }
 
 type SendableCommand = Box<dyn Command + Send + Sync>;
-type CommandSender = mpsc::Sender<SendableCommand>;
-type CommandReceiver = mpsc::Receiver<SendableCommand>;
+type CommandSender = mpsc::UnboundedSender<SendableCommand>;
+type CommandReceiver = mpsc::UnboundedReceiver<SendableCommand>;
 
 // Behaviour struct is used to derive delegated Libp2p behaviour implementation
 #[derive(NetworkBehaviour)]
@@ -107,34 +103,18 @@ pub struct Behaviour {
 	blocked_peers: allow_block_list::Behaviour<BlockedPeers>,
 }
 
-// Init function initializes all needed needed configs for the functioning
-// p2p network Client and network Event Loop
-// If in fat client mode, we enable deleting local Kademlia records as a memory optimization
-pub fn init(
-	cfg: LibP2PConfig,
-	dht_parallelization_limit: usize,
-	ttl: u64,
-	is_fat_client: bool,
-	id_keys: libp2p::identity::Keypair,
-) -> Result<(Client, EventLoop)> {
-	let local_peer_id = PeerId::from(id_keys.public());
-	info!(
-		"Local peer id: {:?}. Public key: {:?}.",
-		local_peer_id,
-		id_keys.public()
-	);
-
-	// Use identify protocol_version as Kademlia protocol name
-	let kademlia_protocol_name =
-		StreamProtocol::try_from_owned(cfg.identify.protocol_version.clone())
-			.expect("Invalid Kademlia protocol name");
-
+fn build_swarm(
+	cfg: &LibP2PConfig,
+	id_keys: &libp2p::identity::Keypair,
+	kad_mode: libp2p::kad::Mode,
+	kad_store: MemoryStore,
+) -> Result<Swarm<Behaviour>> {
 	// build the Swarm, connecting the lower transport logic with the
 	// higher layer network behaviour logic
-	let mut swarm = SwarmBuilder::with_existing_identity(id_keys)
+	let mut swarm = SwarmBuilder::with_existing_identity(id_keys.clone())
 		.with_tokio()
 		.with_tcp(
-			tcp::Config::default().port_reuse(true).nodelay(true),
+			tcp::Config::default().port_reuse(false).nodelay(false),
 			noise::Config::new,
 			yamux::Config::default,
 		)?
@@ -142,35 +122,10 @@ pub fn init(
 		.with_dns()?
 		.with_relay_client(noise::Config::new, yamux::Config::default)?
 		.with_behaviour(|key, relay_client| {
-			// configure Kademlia Memory Store
-			let kad_store = MemoryStore::with_config(
-				key.public().to_peer_id(),
-				MemoryStoreConfig {
-					max_records: cfg.kademlia.max_kad_record_number, // ~2hrs
-					max_value_bytes: cfg.kademlia.max_kad_record_size + 1,
-					max_providers_per_key: usize::from(cfg.kademlia.record_replication_factor), // Needs to match the replication factor, per libp2p docs
-					max_provided_keys: cfg.kademlia.max_kad_provided_keys,
-				},
-			);
-			// create Kademlia Config
-			let mut kad_cfg = kad::Config::default();
-			kad_cfg
-				.set_publication_interval(cfg.kademlia.publication_interval)
-				.set_replication_interval(cfg.kademlia.record_replication_interval)
-				.set_replication_factor(cfg.kademlia.record_replication_factor)
-				.set_query_timeout(cfg.kademlia.query_timeout)
-				.set_parallelism(cfg.kademlia.query_parallelism)
-				.set_caching(kad::Caching::Enabled {
-					max_peers: cfg.kademlia.caching_max_peers,
-				})
-				.disjoint_query_paths(cfg.kademlia.disjoint_query_paths)
-				.set_record_filtering(kad::StoreInserts::FilterBoth)
-				.set_protocol_names(vec![kademlia_protocol_name]);
-
 			// create Identify Protocol Config
 			let identify_cfg =
 				identify::Config::new(cfg.identify.protocol_version.clone(), key.public())
-					.with_agent_version(cfg.identify.agent_version.clone());
+					.with_agent_version(cfg.identify.agent_version.to_string());
 
 			// create AutoNAT Client Config
 			let autonat_cfg = autonat::Config {
@@ -190,7 +145,7 @@ pub fn init(
 				kademlia: kad::Behaviour::with_config(
 					key.public().to_peer_id(),
 					kad_store,
-					kad_cfg,
+					cfg.into(),
 				),
 				auto_nat: autonat::Behaviour::new(key.public().to_peer_id(), autonat_cfg),
 				mdns: mdns::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?,
@@ -198,44 +153,29 @@ pub fn init(
 				blocked_peers: allow_block_list::Behaviour::default(),
 			})
 		})?
-		.with_swarm_config(|c| c.with_idle_connection_timeout(cfg.connection_idle_timeout))
+		.with_swarm_config(|c| {
+			c.with_idle_connection_timeout(cfg.connection_idle_timeout)
+				.with_max_negotiating_inbound_streams(cfg.max_negotiating_inbound_streams)
+				.with_notify_handler_buffer_size(cfg.task_command_buffer_size)
+				.with_dial_concurrency_factor(cfg.dial_concurrency_factor)
+				.with_per_connection_event_buffer_size(cfg.per_connection_event_buffer_size)
+		})
 		.build();
 
-	if is_fat_client {
-		swarm
-			.behaviour_mut()
-			.kademlia
-			.set_mode(Some(KademliaMode::Server.to_kad_mode()));
-	} else {
-		swarm
-			.behaviour_mut()
-			.kademlia
-			.set_mode(Some(cfg.kademlia_mode.to_kad_mode()));
-	}
+	// Setting the mode this way disables automatic mode changes.
+	//
+	// Because the identify protocol doesn't allow us to change
+	// agent data on the fly, we're forced to use static Kad modes
+	// instead of relying on dynamic changes
+	swarm.behaviour_mut().kademlia.set_mode(Some(kad_mode));
 
-	// create sender channel for Event Loop Commands
-	let (command_sender, command_receiver) = mpsc::channel(10000);
-
-	Ok((
-		Client::new(command_sender, dht_parallelization_limit, ttl),
-		EventLoop::new(
-			swarm,
-			command_receiver,
-			cfg.relays,
-			cfg.bootstrap_interval,
-			is_fat_client,
-			IdentityData {
-				agent_version: cfg.identify.agent_version,
-				protocol_version: cfg.identify.protocol_version.clone(),
-			},
-		),
-	))
+	Ok(swarm)
 }
 
 // Keypair function creates identity Keypair for a local node.
 // From such generated keypair it derives multihash identifier of the local peer.
-pub fn keypair(cfg: LibP2PConfig) -> Result<(libp2p::identity::Keypair, String)> {
-	let keypair = match cfg.secret_key {
+pub fn keypair(cfg: &LibP2PConfig) -> Result<(libp2p::identity::Keypair, String)> {
+	let keypair = match cfg.secret_key.as_ref() {
 		// If seed is provided, generate secret key from seed
 		Some(SecretKey::Seed { seed }) => {
 			let seed_digest = multihash::Sha3_256::digest(seed.as_bytes());
@@ -245,7 +185,7 @@ pub fn keypair(cfg: LibP2PConfig) -> Result<(libp2p::identity::Keypair, String)>
 		// Import secret key if provided
 		Some(SecretKey::Key { key }) => {
 			let mut decoded_key = [0u8; 32];
-			hex::decode_to_slice(key.into_bytes(), &mut decoded_key)
+			hex::decode_to_slice(key.clone().into_bytes(), &mut decoded_key)
 				.wrap_err("error decoding secret key from config")?;
 			identity::Keypair::ed25519_from_bytes(decoded_key)
 				.wrap_err("error importing secret key")?

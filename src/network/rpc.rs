@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use avail_subxt::{avail, primitives::Header, utils::H256};
+use avail_subxt::{primitives::Header, utils::H256};
 use codec::Decode;
 use color_eyre::{eyre::eyre, Report, Result};
 use kate_recovery::matrix::{Dimensions, Position};
@@ -13,36 +13,37 @@ use std::{
 	sync::{Arc, Mutex},
 };
 use tokio::{
-	sync::{broadcast, mpsc},
+	sync::broadcast,
 	time::{self, timeout},
 };
 use tracing::{debug, info};
 
 use crate::{
-	consts::EXPECTED_NETWORK_VERSION,
 	network::rpc,
-	types::{GrandpaJustification, State},
+	types::{GrandpaJustification, RetryConfig, State},
 };
 
 mod client;
-mod event_loop;
+mod subscriptions;
 
-pub use client::Client;
-use event_loop::EventLoop;
+use subscriptions::SubscriptionLoop;
 const CELL_SIZE: usize = 32;
 const PROOF_SIZE: usize = 48;
 pub const CELL_WITH_PROOF_SIZE: usize = CELL_SIZE + PROOF_SIZE;
-pub use event_loop::Event;
+pub use subscriptions::Event;
+
+pub use client::Client;
+
+pub enum Subscription {
+	Header(Header),
+	Justification(GrandpaJustification),
+}
 
 #[async_trait]
 pub trait Command {
-	async fn run(&mut self, client: &avail::Client) -> Result<()>;
-	fn abort(&mut self, error: Report);
+	async fn run(&self, client: Client) -> Result<()>;
+	fn abort(&self, error: Report);
 }
-
-type SendableCommand = Box<dyn Command + Send + Sync>;
-type CommandSender = mpsc::Sender<SendableCommand>;
-type CommandReceiver = mpsc::Receiver<SendableCommand>;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct WrappedJustification(pub GrandpaJustification);
@@ -79,38 +80,40 @@ impl<'de> Deserialize<'de> for WrappedProof {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Node {
 	pub host: String,
 	pub system_version: String,
+	pub spec_name: String,
 	pub spec_version: u32,
 	pub genesis_hash: H256,
 }
 
 impl Node {
+	pub fn new(
+		host: String,
+		system_version: String,
+		spec_name: String,
+		spec_version: u32,
+		genesis_hash: H256,
+	) -> Self {
+		Self {
+			host,
+			system_version,
+			spec_name,
+			spec_version,
+			genesis_hash,
+		}
+	}
+
 	pub fn network(&self) -> String {
 		format!(
 			"{host}/{system_version}/{spec_name}/{spec_version}",
 			host = self.host,
 			system_version = self.system_version,
-			spec_name = EXPECTED_NETWORK_VERSION.spec_name,
+			spec_name = self.spec_name,
 			spec_version = self.spec_version,
 		)
-	}
-
-	pub fn with_spec_version(&mut self, spec_version: u32) -> &mut Self {
-		self.spec_version = spec_version;
-		self
-	}
-
-	pub fn with_system_version(&mut self, system_version: String) -> &mut Self {
-		self.system_version = system_version;
-		self
-	}
-
-	pub fn with_genesis_hash(&mut self, genesis_hash: H256) -> &mut Self {
-		self.genesis_hash = genesis_hash;
-		self
 	}
 }
 
@@ -119,103 +122,100 @@ impl Default for Node {
 		Self {
 			host: "{host}".to_string(),
 			system_version: "{system_version}".to_string(),
+			spec_name: "data-avail".to_string(),
 			spec_version: 0,
-			genesis_hash: H256::default(),
+			genesis_hash: Default::default(),
 		}
 	}
 }
 
+impl Display for Node {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "v{}/{}", self.system_version, self.spec_name)
+	}
+}
+
+#[derive(Clone)]
 pub struct Nodes {
 	list: Vec<Node>,
-	current_index: usize,
 }
 
 impl Nodes {
-	pub fn next_node(&mut self) -> Option<Node> {
-		// we have exhausted all nodes from the list
-		// this is the last one
-		if self.current_index == self.list.len() - 1 {
-			None
-		} else {
-			// increment current index
-			self.current_index += 1;
-			self.get_current()
-		}
-	}
-
-	pub fn get_current(&self) -> Option<Node> {
-		let node = &self.list[self.current_index];
-		Some(node.clone())
-	}
-
 	pub fn new(nodes: &[String]) -> Self {
 		let candidates = nodes.to_owned();
 		Self {
 			list: candidates
 				.iter()
 				.map(|s| Node {
+					spec_name: Default::default(),
 					genesis_hash: Default::default(),
 					spec_version: Default::default(),
 					system_version: Default::default(),
 					host: s.to_string(),
 				})
 				.collect(),
-			current_index: 0,
 		}
 	}
 
-	fn shuffle(&mut self) {
-		self.list.shuffle(&mut thread_rng());
+	/// Shuffles the list of available Nodes, excluding the host used for the current Subxt client creation.
+	///
+	/// This method returns a new shuffled list of Nodes from the original list, excluding the Node
+	/// associated with the current Subxt client host.
+	/// The purpose of this exclusion is to prevent accidentally reconnecting to the same host in case of errors.
+	/// If there's a need to switch to a different host, the shuffled list provides a randomized order of available Nodes.
+	fn shuffle(&self, current_host: String) -> Vec<Node> {
+		if self.list.len() <= 1 {
+			return self.list.clone();
+		}
+
+		let mut list = self
+			.list
+			.iter()
+			.filter(|&Node { host, .. }| host != &current_host)
+			.cloned()
+			.collect::<Vec<Node>>();
+		list.shuffle(&mut thread_rng());
+		list
 	}
 
-	fn reset(&mut self) -> Option<Node> {
-		// shuffle the available list of nodes
-		self.shuffle();
-		// set the current index to the first one
-		self.current_index = 0;
-		self.get_current()
-	}
-}
-
-#[derive(Debug)]
-pub struct ExpectedVersion<'a> {
-	pub version: &'a str,
-	pub spec_name: &'a str,
-}
-
-impl ExpectedVersion<'_> {
-	/// Checks if expected version matches network version.
-	/// Since the light client uses subset of the node APIs, `matches` checks only prefix of a node version.
-	/// This means that if expected version is `1.6`, versions `1.6.x` of the node will match.
-	/// Specification name is checked for exact match.
-	/// Since runtime `spec_version` can be changed with runtime upgrade, `spec_version` is removed.
-	/// NOTE: Runtime compatibility check is currently not implemented.
-	pub fn matches(&self, node_version: &str, spec_name: &str) -> bool {
-		node_version.starts_with(self.version) && self.spec_name == spec_name
+	pub fn iter(&self) -> NodesIterator {
+		NodesIterator {
+			nodes: self,
+			current_index: 0,
+		}
 	}
 }
 
-impl Display for ExpectedVersion<'_> {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "v{}/{}", self.version, self.spec_name)
+pub struct NodesIterator<'a> {
+	nodes: &'a Nodes,
+	current_index: usize,
+}
+
+impl<'a> Iterator for NodesIterator<'a> {
+	type Item = &'a Node;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		let res = self.nodes.list.get(self.current_index);
+		self.current_index += 1;
+		res
 	}
 }
 
-pub fn init(
+pub async fn init(
 	db: Arc<DB>,
 	state: Arc<Mutex<State>>,
 	nodes: &[String],
-) -> (Client, broadcast::Sender<Event>, EventLoop) {
-	// create channel for Event Loop Commands
-	let (command_sender, command_receiver) = mpsc::channel(1000);
+	genesis_hash: &str,
+	retry_config: RetryConfig,
+) -> Result<(Client, broadcast::Sender<Event>, SubscriptionLoop)> {
+	let rpc_client =
+		Client::new(state.clone(), Nodes::new(nodes), genesis_hash, retry_config).await?;
 	// create output channel for RPC Subscription Events
 	let (event_sender, _) = broadcast::channel(1000);
+	let subscriptions =
+		SubscriptionLoop::new(state, db, rpc_client.clone(), event_sender.clone()).await?;
 
-	(
-		Client::new(command_sender),
-		event_sender.clone(),
-		EventLoop::new(db, state, Nodes::new(nodes), command_receiver, event_sender),
-	)
+	Ok((rpc_client, event_sender, subscriptions))
 }
 
 /// Generates random cell positions for sampling

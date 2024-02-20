@@ -4,11 +4,13 @@ use libp2p::{
 	autonat::{self, NatStatus},
 	dcutr,
 	identify::{self, Info},
+	identity::Keypair,
 	kad::{
 		self, BootstrapOk, GetRecordOk, InboundRequest, QueryId, QueryResult, QueryStats, RecordKey,
 	},
 	mdns,
 	multiaddr::Protocol,
+	ping,
 	swarm::{
 		dial_opts::{DialOpts, PeerCondition},
 		ConnectionError, SwarmEvent,
@@ -16,18 +18,23 @@ use libp2p::{
 	upnp, Multiaddr, PeerId, Swarm,
 };
 use rand::seq::SliceRandom;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use tokio::{
 	sync::oneshot,
 	time::{interval_at, Instant, Interval},
 };
 use tracing::{debug, error, info, trace, warn};
 
-use crate::telemetry::{MetricCounter, MetricValue, Metrics};
+use crate::{
+	network::p2p::kad_mem_store::MemoryStore,
+	shutdown::Controller,
+	telemetry::{MetricCounter, MetricValue, Metrics},
+	types::{AgentVersion, IdentifyConfig, KademliaMode, LibP2PConfig},
+};
 
 use super::{
-	client::BlockStat, Behaviour, BehaviourEvent, CommandReceiver, EventLoopEntries, QueryChannel,
-	SendableCommand,
+	build_swarm, client::BlockStat, Behaviour, BehaviourEvent, CommandReceiver, EventLoopEntries,
+	QueryChannel, SendableCommand,
 };
 
 // RelayState keeps track of all things relay related
@@ -69,24 +76,20 @@ struct BootstrapState {
 	timer: Interval,
 }
 
-// Identity strings used for peer filtering
-pub struct IdentityData {
-	pub agent_version: String,
-	pub protocol_version: String,
-}
-
 pub struct EventLoop {
 	swarm: Swarm<Behaviour>,
-	command_receiver: CommandReceiver,
+	// Tracking Kademlia events
 	pending_kad_queries: HashMap<QueryId, QueryChannel>,
-	pending_kad_routing: HashMap<PeerId, oneshot::Sender<Result<()>>>,
+	// Tracking swarm events (i.e. peer dialing)
 	pending_swarm_events: HashMap<PeerId, oneshot::Sender<Result<()>>>,
 	relay: RelayState,
 	bootstrap: BootstrapState,
-	kad_remove_local_record: bool,
+	is_fat_client: bool,
 	/// Blocks we monitor for PUT success rate
 	active_blocks: HashMap<u32, BlockStat>,
-	identity_data: IdentityData,
+	shutdown: Controller<String>,
+	// Used for checking protocol version
+	identity_data: IdentifyConfig,
 }
 
 #[derive(PartialEq, Debug)]
@@ -114,46 +117,69 @@ impl TryFrom<RecordKey> for DHTKey {
 
 impl EventLoop {
 	pub fn new(
-		swarm: Swarm<Behaviour>,
-		command_receiver: CommandReceiver,
-		relay_nodes: Vec<(PeerId, Multiaddr)>,
-		bootstrap_interval: Duration,
-		kad_remove_local_record: bool,
-		identity_data: IdentityData,
+		cfg: LibP2PConfig,
+		id_keys: &Keypair,
+		is_fat_client: bool,
+		shutdown: Controller<String>,
 	) -> Self {
+		let bootstrap_interval = cfg.bootstrap_interval;
+		let kad_mode = cfg.kademlia.kademlia_mode.into();
+		let peer_id = id_keys.public().to_peer_id();
+		let store = MemoryStore::with_config(peer_id, (&cfg).into());
+
+		let swarm = build_swarm(&cfg, id_keys, kad_mode, store).expect("Swarm can be built");
+
 		Self {
 			swarm,
-			command_receiver,
 			pending_kad_queries: Default::default(),
-			pending_kad_routing: Default::default(),
 			pending_swarm_events: Default::default(),
 			relay: RelayState {
 				id: PeerId::random(),
 				address: Multiaddr::empty(),
 				is_circuit_established: false,
-				nodes: relay_nodes,
+				nodes: cfg.relays,
 			},
 			bootstrap: BootstrapState {
 				is_startup_done: false,
 				timer: interval_at(Instant::now() + bootstrap_interval, bootstrap_interval),
 			},
-			kad_remove_local_record,
+			is_fat_client,
 			active_blocks: Default::default(),
-			identity_data,
+			shutdown,
+			identity_data: cfg.identify,
 		}
 	}
 
-	pub async fn run(mut self, metrics: Arc<impl Metrics>) {
+	pub async fn run(mut self, metrics: Arc<impl Metrics>, mut command_receiver: CommandReceiver) {
+		// shutdown will wait as long as this token is not dropped
+		let _delay_token = self
+			.shutdown
+			.delay_token()
+			.expect("There should not be any shutdowns at the begging of the P2P Event Loop");
+
 		loop {
 			tokio::select! {
 				event = self.swarm.next() => self.handle_event(event.expect("Swarm stream should be infinite"), metrics.clone()).await,
-				command = self.command_receiver.recv() => match command {
+				command = command_receiver.recv() => match command {
 					Some(c) => self.handle_command(c).await,
 					// Command channel closed, thus shutting down the network event loop.
-					None => return,
+					None => break,
 				},
 				_ = self.bootstrap.timer.tick() => self.handle_periodic_bootstraps(),
+				// if the shutdown was triggered,
+				// break the loop immediately, proceed to the cleanup phase
+				_ = self.shutdown.triggered_shutdown() => break
 			}
+		}
+		self.disconnect_peers();
+		info!("Exiting event loop...");
+	}
+
+	fn disconnect_peers(&mut self) {
+		let connected_peers: Vec<PeerId> = self.swarm.connected_peers().cloned().collect();
+		// close all active connections with other peers
+		for peer in connected_peers {
+			_ = self.swarm.disconnect_peer_id(peer);
 		}
 	}
 
@@ -174,9 +200,6 @@ impl EventLoop {
 						..
 					} => {
 						trace!("Routing updated. Peer: {peer:?}. is_new_peer: {is_new_peer:?}. Addresses: {addresses:#?}. Old peer: {old_peer:#?}");
-						if let Some(ch) = self.pending_kad_routing.remove(&peer) {
-							_ = ch.send(Ok(()));
-						}
 					},
 					kad::Event::RoutablePeer { peer, address } => {
 						trace!("RoutablePeer. Peer: {peer:?}.  Address: {address:?}");
@@ -207,6 +230,10 @@ impl EventLoop {
 							}
 						},
 						_ => {},
+					},
+					kad::Event::ModeChanged { new_mode } => {
+						trace!("Kademlia mode changed: {new_mode:?}");
+						// TODO: dynamic change of identify protocols Kad mode
 					},
 					kad::Event::OutboundQueryProgressed {
 						id, result, stats, ..
@@ -277,29 +304,35 @@ impl EventLoop {
 						},
 						_ => {},
 					},
-					_ => {},
 				}
 			},
-			SwarmEvent::Behaviour(BehaviourEvent::Identify(event)) => {
-				match event {
-					identify::Event::Received {
-						peer_id,
-						info:
-							Info {
-								listen_addrs,
-								agent_version,
-								protocol_version,
-								..
-							},
-					} => {
-						trace!("Identity Received from: {peer_id:?} on listen address: {listen_addrs:?}");
-						if agent_version != self.identity_data.agent_version
-							&& protocol_version != self.identity_data.protocol_version
+			SwarmEvent::Behaviour(BehaviourEvent::Identify(event)) => match event {
+				identify::Event::Received {
+					peer_id,
+					info:
+						Info {
+							listen_addrs,
+							agent_version,
+							protocol_version,
+							..
+						},
+				} => {
+					trace!(
+						"Identity Received from: {peer_id:?} on listen address: {listen_addrs:?}"
+					);
+					let incoming_peer_agent_version = match AgentVersion::from_str(&agent_version) {
+						Ok(agent) => agent,
+						Err(e) => {
+							debug!("Error parsing incoming agent version: {e}");
+							return;
+						},
+					};
+					if protocol_version == self.identity_data.protocol_version {
+						// Add peer to routing table only if it's in Kademlia server mode
+						if incoming_peer_agent_version.kademlia_mode
+							== KademliaMode::Server.to_string()
 						{
-							trace!("Removing and blocking non-avail peer from routing table. Peer: {peer_id}. Agent: {agent_version}. Protocol: {protocol_version}");
-							self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
-							self.swarm.behaviour_mut().blocked_peers.block_peer(peer_id);
-						} else {
+							trace!("Adding peer {peer_id} to routing table.");
 							for addr in listen_addrs {
 								self.swarm
 									.behaviour_mut()
@@ -307,17 +340,22 @@ impl EventLoop {
 									.add_address(&peer_id, addr);
 							}
 						}
-					},
-					identify::Event::Sent { peer_id } => {
-						trace!("Identity Sent event to: {peer_id:?}");
-					},
-					identify::Event::Pushed { peer_id, .. } => {
-						trace!("Identify Pushed event. PeerId: {peer_id:?}");
-					},
-					identify::Event::Error { peer_id, error } => {
-						trace!("Identify Error event. PeerId: {peer_id:?}. Error: {error:?}");
-					},
-				}
+					} else {
+						// Block and remove non-Avail peers
+						debug!("Removing and blocking non-avail peer from routing table. Peer: {peer_id}. Agent: {agent_version}. Protocol: {protocol_version}");
+						self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+						self.swarm.behaviour_mut().blocked_peers.block_peer(peer_id);
+					}
+				},
+				identify::Event::Sent { peer_id } => {
+					trace!("Identity Sent event to: {peer_id:?}");
+				},
+				identify::Event::Pushed { peer_id, .. } => {
+					trace!("Identify Pushed event. PeerId: {peer_id:?}");
+				},
+				identify::Event::Error { peer_id, error } => {
+					trace!("Identify Error event. PeerId: {peer_id:?}. Error: {error:?}");
+				},
 			},
 			SwarmEvent::Behaviour(BehaviourEvent::Mdns(event)) => match event {
 				mdns::Event::Discovered(addrs_list) => {
@@ -364,8 +402,11 @@ impl EventLoop {
 					// if so, create reservation request with relay
 					if new == NatStatus::Private || old == NatStatus::Private {
 						info!("Autonat says we're still private.");
-						// select a relay, try to dial it
-						self.select_and_dial_relay();
+						// Fat clients should always be in Kademlia client mode, no need to do NAT traversal
+						if !self.is_fat_client {
+							// select a relay, try to dial it
+							self.select_and_dial_relay();
+						}
 					};
 				},
 			},
@@ -380,6 +421,13 @@ impl EventLoop {
 				Err(err) => {
 					trace!("Hole punching failed with: {remote_peer_id:#?}. Error: {err:#?}")
 				},
+			},
+			SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { result, .. })) => {
+				if let Ok(rtt) = result {
+					let _ = metrics
+						.record(MetricValue::PingLatency(rtt.as_millis() as f64))
+						.await;
+				}
 			},
 			SwarmEvent::Behaviour(BehaviourEvent::Upnp(event)) => match event {
 				upnp::Event::NewExternalAddr(addr) => {
@@ -433,31 +481,12 @@ impl EventLoop {
 
 						if let Some(peer_id) = peer_id {
 							// Notify the connections we're waiting on an error has occured
-							if let libp2p::swarm::DialError::WrongPeerId { obtained, endpoint } =
-								&error
-							{
+							if let libp2p::swarm::DialError::WrongPeerId { .. } = &error {
 								if let Some(peer) =
 									self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id)
 								{
 									let removed_peer_id = peer.node.key.preimage();
-									debug!(
-										"Removed peer: {removed_peer_id} from the routing table"
-									);
-
-									match self.swarm.behaviour_mut().kademlia.add_address(
-										obtained,
-										endpoint.get_remote_address().clone(),
-									) {
-										kad::RoutingUpdate::Success => {
-											debug!("RoutingUpdate::Success for {obtained}");
-										},
-										kad::RoutingUpdate::Pending => {
-											debug!("RoutingUpdate::Pending for {obtained}");
-										},
-										kad::RoutingUpdate::Failed => {
-											debug!("RoutingUpdate::Failed for {obtained}");
-										},
-									}
+									debug!("Removed peer {removed_peer_id} from the routing table");
 								}
 							}
 							if let Some(ch) = self.pending_swarm_events.remove(&peer_id) {
@@ -488,7 +517,7 @@ impl EventLoop {
 		if let Err(err) = command.run(EventLoopEntries::new(
 			&mut self.swarm,
 			&mut self.pending_kad_queries,
-			&mut self.pending_kad_routing,
+			&mut self.pending_swarm_events,
 			&mut self.active_blocks,
 		)) {
 			command.abort(eyre!(err));
@@ -583,7 +612,7 @@ impl EventLoop {
 				.unwrap_or_default();
 
 			if block.remaining_counter == 0 {
-				let success_rate = block.error_counter as f64 / block.total_count as f64;
+				let success_rate = block.success_counter as f64 / block.total_count as f64;
 				info!(
 					"Cell upload success rate for block {block_num}: {}/{}. Duration: {}",
 					block.success_counter, block.total_count, block.time_stat
@@ -597,7 +626,7 @@ impl EventLoop {
 					.await;
 			}
 
-			if self.kad_remove_local_record {
+			if self.is_fat_client {
 				// Remove local records for fat clients (memory optimization)
 				debug!("Pruning local records on fat client");
 				self.swarm.behaviour_mut().kademlia.remove_record(&key);

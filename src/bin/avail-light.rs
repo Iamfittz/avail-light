@@ -1,21 +1,21 @@
 #![doc = include_str!("../../README.md")]
 
 use avail_core::AppId;
-use avail_light::network;
-use avail_light::telemetry::otlp::MetricAttributes;
-use avail_light::types::IdentityConfig;
-use avail_light::{api, data, network::rpc, telemetry};
 use avail_light::{
-	consts::EXPECTED_NETWORK_VERSION,
-	network::p2p,
-	types::{CliOpts, RuntimeConfig, State},
+	api,
+	consts::EXPECTED_SYSTEM_VERSION,
+	data,
+	maintenance::StaticConfigParams,
+	network::{self, p2p, rpc},
+	shutdown::Controller,
+	telemetry::{self, otlp::MetricAttributes},
+	types::{CliOpts, IdentityConfig, LibP2PConfig, RuntimeConfig, State},
 };
 use clap::Parser;
 use color_eyre::{
 	eyre::{eyre, WrapErr},
-	Report, Result,
+	Result,
 };
-use futures::TryFutureExt;
 use kate_recovery::com::AppData;
 use libp2p::{multiaddr::Protocol, Multiaddr};
 use std::{
@@ -24,15 +24,9 @@ use std::{
 	path::Path,
 	sync::{Arc, Mutex},
 };
-use tokio::sync::RwLock;
-use tokio::sync::{
-	broadcast,
-	mpsc::{channel, Sender},
-};
-use tracing::Subscriber;
-use tracing::{error, info, metadata::ParseLevelError, trace, warn, Level};
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::{fmt::format, FmtSubscriber};
+use tokio::sync::{broadcast, mpsc, RwLock};
+use tracing::{error, info, metadata::ParseLevelError, trace, warn, Level, Subscriber};
+use tracing_subscriber::{fmt::format, EnvFilter, FmtSubscriber};
 
 #[cfg(feature = "network-analysis")]
 use avail_light::network::p2p::analyzer;
@@ -74,7 +68,7 @@ fn parse_log_level(log_level: &str, default: Level) -> (Level, Option<ParseLevel
 		.unwrap_or_else(|parse_err| (default, Some(parse_err)))
 }
 
-async fn run(error_sender: Sender<Report>) -> Result<()> {
+async fn run(shutdown: Controller<String>) -> Result<()> {
 	let opts = CliOpts::parse();
 
 	let mut cfg: RuntimeConfig = RuntimeConfig::default();
@@ -121,9 +115,10 @@ async fn run(error_sender: Sender<Report>) -> Result<()> {
 
 	let db = data::init_db(&cfg.avail_path).wrap_err("Cannot initialize database")?;
 
-	let (id_keys, peer_id) = p2p::keypair((&cfg).into())?;
+	let cfg_libp2p: LibP2PConfig = (&cfg).into();
+	let (id_keys, peer_id) = p2p::keypair(&cfg_libp2p)?;
 
-	let metric_attribues = MetricAttributes {
+	let metric_attributes = MetricAttributes {
 		role: client_role.into(),
 		peer_id,
 		ip: RwLock::new("".to_string()),
@@ -131,13 +126,6 @@ async fn run(error_sender: Sender<Report>) -> Result<()> {
 		origin: cfg.origin.clone(),
 		avail_address: identity_cfg.avail_address.clone(),
 		operating_mode: cfg.operation_mode.to_string(),
-		replication_factor: cfg.replication_factor as i64,
-		query_timeout: cfg.query_timeout as i64,
-		block_processing_delay: cfg
-			.block_processing_delay
-			.map(|val| val as i64)
-			.unwrap_or(0),
-		confidence_treshold: cfg.confidence as i64,
 		partition_size: cfg
 			.block_matrix_partition
 			.map(|_| {
@@ -152,57 +140,44 @@ async fn run(error_sender: Sender<Report>) -> Result<()> {
 				)
 			})
 			.unwrap_or("n/a".to_string()),
-		#[cfg(feature = "crawl")]
-		crawl_block_delay: cfg.crawl.crawl_block_delay,
 	};
 
 	let ot_metrics = Arc::new(
-		telemetry::otlp::initialize(cfg.ot_collector_endpoint.clone(), metric_attribues)
+		telemetry::otlp::initialize(cfg.ot_collector_endpoint.clone(), metric_attributes)
 			.wrap_err("Unable to initialize OpenTelemetry service")?,
 	);
 
-	// raise new P2P Network Client and Event Loop
-	let (p2p_client, p2p_event_loop) = p2p::init(
-		(&cfg).into(),
+	// Create sender channel for P2P event loop commands
+	let (p2p_event_loop_sender, p2p_event_loop_receiver) = mpsc::unbounded_channel();
+
+	let p2p_event_loop =
+		p2p::EventLoop::new(cfg_libp2p, &id_keys, cfg.is_fat_client(), shutdown.clone());
+
+	tokio::spawn(
+		shutdown.with_cancel(p2p_event_loop.run(ot_metrics.clone(), p2p_event_loop_receiver)),
+	);
+
+	let p2p_client = p2p::Client::new(
+		p2p_event_loop_sender,
 		cfg.dht_parallelization_limit,
 		cfg.kad_record_ttl,
-		cfg.is_fat_client(),
-		id_keys,
-	)
-	.wrap_err("Failed to init Network Service")?;
-
-	// spawn the P2P Network task for Event Loop run in the background
-	tokio::spawn(p2p_event_loop.run(ot_metrics.clone()));
+	);
 
 	// Start listening on provided port
 	let port = cfg.port;
-
-	// always listen on UDP to prioritize QUIC
 	p2p_client
 		.start_listening(
 			Multiaddr::empty()
 				.with(Protocol::from(Ipv4Addr::UNSPECIFIED))
-				.with(Protocol::Udp(port))
-				.with(Protocol::QuicV1),
-		)
-		.await
-		.wrap_err("Listening on UDP not to fail.")?;
-	info!("Listening for QUIC on port: {port}");
-
-	let tcp_port = port + 1;
-	p2p_client
-		.start_listening(
-			Multiaddr::empty()
-				.with(Protocol::from(Ipv4Addr::UNSPECIFIED))
-				.with(Protocol::Tcp(tcp_port)),
+				.with(Protocol::Tcp(port)),
 		)
 		.await
 		.wrap_err("Listening on TCP not to fail.")?;
-	info!("Listening for TCP on port: {tcp_port}");
+	info!("TCP listener started on port {port}");
 
 	let p2p_clone = p2p_client.to_owned();
 	let cfg_clone = cfg.to_owned();
-	tokio::spawn(async move {
+	tokio::spawn(shutdown.with_cancel(async move {
 		info!("Bootstraping the DHT with bootstrap nodes...");
 		let bs_result = p2p_clone
 			.bootstrap_on_startup(cfg_clone.bootstraps.iter().map(Into::into).collect())
@@ -215,10 +190,10 @@ async fn run(error_sender: Sender<Report>) -> Result<()> {
 				warn!("Bootstrap process: {e:?}.");
 			},
 		}
-	});
+	}));
 
 	#[cfg(feature = "network-analysis")]
-	tokio::task::spawn(analyzer::start_traffic_analyzer(cfg.port, 10));
+	tokio::task::spawn(shutdown.with_cancel(analyzer::start_traffic_analyzer(cfg.port, 10)));
 
 	let pp = Arc::new(kate_recovery::couscous::public_params());
 	let raw_pp = pp.to_raw_var_bytes();
@@ -227,8 +202,14 @@ async fn run(error_sender: Sender<Report>) -> Result<()> {
 	trace!("Public params ({public_params_len}): hash: {public_params_hash}");
 
 	let state = Arc::new(Mutex::new(State::default()));
-	let (rpc_client, rpc_events, rpc_event_loop) =
-		rpc::init(db.clone(), state.clone(), &cfg.full_node_ws);
+	let (rpc_client, rpc_events, rpc_subscriptions) = rpc::init(
+		db.clone(),
+		state.clone(),
+		&cfg.full_node_ws,
+		&cfg.genesis_hash,
+		cfg.retry_config.clone(),
+	)
+	.await?;
 
 	// Subscribing to RPC events before first event is published
 	let publish_rpc_event_receiver = rpc_events.subscribe();
@@ -238,20 +219,46 @@ async fn run(error_sender: Sender<Report>) -> Result<()> {
 	let crawler_rpc_event_receiver = rpc_events.subscribe();
 
 	// spawn the RPC Network task for Event Loop to run in the background
-	let rpc_event_loop_handle = tokio::spawn(rpc_event_loop.run(EXPECTED_NETWORK_VERSION));
+	// and shut it down, without delays
+	let rpc_subscriptions_handle = tokio::spawn(shutdown.with_cancel(shutdown.with_trigger(
+		"Subscription loop failure triggered shutdown".to_string(),
+		async {
+			let result = rpc_subscriptions.run().await;
+			if let Err(ref err) = result {
+				error!(%err, "Subscription loop ended with error");
+			};
+			result
+		},
+	)));
 
 	info!("Waiting for first finalized header...");
-	let block_header = rpc::wait_for_finalized_header(first_header_rpc_event_receiver, 60)
-		.or_else(|err| async move {
-			if !rpc_event_loop_handle.is_finished() {
-				return Err(err);
+	let block_header = match shutdown
+		.with_cancel(rpc::wait_for_finalized_header(
+			first_header_rpc_event_receiver,
+			360,
+		))
+		.await
+	{
+		Ok(Err(report)) => {
+			if !rpc_subscriptions_handle.is_finished() {
+				return Err(report);
 			}
-			let Ok(Err(event_loop_error)) = rpc_event_loop_handle.await else {
-				return Err(err);
+			let Ok(Ok(Err(subscriptions_error))) = rpc_subscriptions_handle.await else {
+				return Err(report);
 			};
-			Err(event_loop_error.wrap_err(err))
-		})
-		.await?;
+			return Err(eyre!(subscriptions_error));
+		},
+		Ok(Ok(num)) => num,
+		Err(shutdown_reason) => {
+			if !rpc_subscriptions_handle.is_finished() {
+				return Err(eyre!(shutdown_reason));
+			}
+			let Ok(Ok(Err(event_loop_error))) = rpc_subscriptions_handle.await else {
+				return Err(eyre!(shutdown_reason));
+			};
+			return Err(eyre!(event_loop_error));
+		},
+	};
 
 	state.lock().unwrap().latest = block_header.number;
 	let sync_range = cfg.sync_range(block_header.number);
@@ -265,18 +272,18 @@ async fn run(error_sender: Sender<Report>) -> Result<()> {
 		identity_cfg,
 		state: state.clone(),
 		version: format!("v{}", clap::crate_version!()),
-		network_version: EXPECTED_NETWORK_VERSION.to_string(),
+		network_version: EXPECTED_SYSTEM_VERSION[0].to_string(),
 		node_client: rpc_client.clone(),
 		ws_clients: ws_clients.clone(),
+		shutdown: shutdown.clone(),
 	};
-
-	tokio::task::spawn(server.run());
+	tokio::task::spawn(shutdown.with_cancel(server.bind()));
 
 	let (block_tx, block_rx) = broadcast::channel::<avail_light::types::BlockVerified>(1 << 7);
 
 	let data_rx = cfg.app_id.map(AppId).map(|app_id| {
 		let (data_tx, data_rx) = broadcast::channel::<(u32, AppData)>(1 << 7);
-		tokio::task::spawn(avail_light::app_client::run(
+		tokio::task::spawn(shutdown.with_cancel(avail_light::app_client::run(
 			(&cfg).into(),
 			db.clone(),
 			p2p_client.clone(),
@@ -287,40 +294,42 @@ async fn run(error_sender: Sender<Report>) -> Result<()> {
 			state.clone(),
 			sync_range.clone(),
 			data_tx,
-			error_sender.clone(),
-		));
+			shutdown.clone(),
+		)));
 		data_rx
 	});
 
-	tokio::task::spawn(api::v2::publish(
+	tokio::task::spawn(shutdown.with_cancel(api::v2::publish(
 		api::v2::types::Topic::HeaderVerified,
 		publish_rpc_event_receiver,
 		ws_clients.clone(),
-	));
+	)));
 
-	tokio::task::spawn(api::v2::publish(
+	tokio::task::spawn(shutdown.with_cancel(api::v2::publish(
 		api::v2::types::Topic::ConfidenceAchieved,
 		block_tx.subscribe(),
 		ws_clients.clone(),
-	));
+	)));
 
 	if let Some(data_rx) = data_rx {
-		tokio::task::spawn(api::v2::publish(
+		tokio::task::spawn(shutdown.with_cancel(api::v2::publish(
 			api::v2::types::Topic::DataVerified,
 			data_rx,
 			ws_clients,
-		));
+		)));
 	}
 
 	#[cfg(feature = "crawl")]
 	if cfg.crawl.crawl_block {
-		tokio::task::spawn(avail_light::crawl_client::run(
+		let partition = cfg.crawl.crawl_block_matrix_partition;
+		tokio::task::spawn(shutdown.with_cancel(avail_light::crawl_client::run(
 			crawler_rpc_event_receiver,
 			p2p_client.clone(),
 			cfg.crawl.crawl_block_delay,
 			ot_metrics.clone(),
 			cfg.crawl.crawl_block_mode,
-		));
+			partition.unwrap_or(avail_light::crawl_client::ENTIRE_BLOCK),
+		)));
 	}
 
 	let sync_client = avail_light::sync_client::new(db.clone(), rpc_client.clone());
@@ -334,24 +343,24 @@ async fn run(error_sender: Sender<Report>) -> Result<()> {
 
 	if cfg.sync_start_block.is_some() {
 		state.lock().unwrap().synced.replace(false);
-		tokio::task::spawn(avail_light::sync_client::run(
+		tokio::task::spawn(shutdown.with_cancel(avail_light::sync_client::run(
 			sync_client,
 			sync_network_client,
 			(&cfg).into(),
 			sync_range,
 			block_tx.clone(),
 			state.clone(),
-		));
+		)));
 	}
 
 	if cfg.sync_finality_enable {
 		let sync_finality = avail_light::sync_finality::new(db.clone(), rpc_client.clone());
-		tokio::task::spawn(avail_light::sync_finality::run(
+		tokio::task::spawn(shutdown.with_cancel(avail_light::sync_finality::run(
 			sync_finality,
-			error_sender.clone(),
+			shutdown.clone(),
 			state.clone(),
 			block_header.clone(),
-		));
+		)));
 	} else {
 		let mut s = state
 			.lock()
@@ -360,80 +369,71 @@ async fn run(error_sender: Sender<Report>) -> Result<()> {
 		s.finality_synced = true;
 	}
 
-	tokio::task::spawn(avail_light::maintenance::run(
+	let static_config_params = StaticConfigParams {
+		block_confidence_treshold: cfg.confidence,
+		replication_factor: cfg.replication_factor,
+		query_timeout: cfg.query_timeout,
+	};
+
+	tokio::task::spawn(shutdown.with_cancel(avail_light::maintenance::run(
 		p2p_client.clone(),
 		ot_metrics.clone(),
 		block_rx,
-		error_sender.clone(),
-	));
+		static_config_params,
+		shutdown.clone(),
+	)));
 
 	let channels = avail_light::types::ClientChannels {
 		block_sender: block_tx,
 		rpc_event_receiver: client_rpc_event_receiver,
-		error_sender: error_sender.clone(),
 	};
 
 	if let Some(partition) = cfg.block_matrix_partition {
 		let fat_client =
 			avail_light::fat_client::new(db.clone(), p2p_client.clone(), rpc_client.clone());
 
-		tokio::task::spawn(avail_light::fat_client::run(
+		tokio::task::spawn(shutdown.with_cancel(avail_light::fat_client::run(
 			fat_client,
 			(&cfg).into(),
 			ot_metrics.clone(),
 			channels,
 			partition,
-		));
+			shutdown.clone(),
+		)));
 	} else {
 		let light_client = avail_light::light_client::new(db.clone());
 
 		let light_network_client = network::new(p2p_client, rpc_client, pp, cfg.disable_rpc);
 
-		tokio::task::spawn(avail_light::light_client::run(
+		tokio::task::spawn(shutdown.with_cancel(avail_light::light_client::run(
 			light_client,
 			light_network_client,
 			(&cfg).into(),
 			ot_metrics,
 			state.clone(),
 			channels,
-		));
+			shutdown.clone(),
+		)));
 	}
 
 	Ok(())
 }
 
-fn install_panic_hooks() -> Result<()> {
+fn install_panic_hooks(shutdown: Controller<String>) -> Result<()> {
 	// initialize color-eyre hooks
 	let (panic_hook, eyre_hook) = color_eyre::config::HookBuilder::default()
-		.panic_section(format!(
-			"This is bug. Please, consider reporting it to us at {}",
-			env!("CARGO_PKG_REPOSITORY")
-		))
 		.display_location_section(true)
 		.display_env_section(true)
 		.into_hooks();
+
 	// install hook as global handler
 	eyre_hook.install()?;
 
 	std::panic::set_hook(Box::new(move |panic_info| {
-		let msg = format!("{}", panic_hook.panic_report(panic_info));
-		#[cfg(not(debug_assertions))]
-		{
-			// prints color-eyre stack to stderr in production builds
-			eprintln!("{}", msg);
-			use human_panic::{handle_dump, print_msg, Metadata};
-			let meta = Metadata {
-				version: env!("CARGO_PKG_VERSION").into(),
-				name: env!("CARGO_PKG_NAME").into(),
-				authors: env!("CARGO_PKG_AUTHORS").into(),
-				homepage: env!("CARGO_PKG_HOMEPAGE").into(),
-			};
+		// trigger shutdown to stop other tasks if panic occurrs
+		let _ = shutdown.trigger_shutdown("Panic occurred, shuting down".to_string());
 
-			let file_path = handle_dump(&meta, panic_info);
-			// prints human-panic message
-			print_msg(file_path, &meta)
-				.expect("human-panic: printing error message to console failed");
-		}
+		let msg = format!("{}", panic_hook.panic_report(panic_info));
 		error!("Error: {}", strip_ansi_escapes::strip_str(msg));
 
 		#[cfg(debug_assertions)]
@@ -445,29 +445,70 @@ fn install_panic_hooks() -> Result<()> {
 				.verbosity(better_panic::Verbosity::Medium)
 				.create_panic_handler()(panic_info);
 		}
-
-		std::process::exit(libc::EXIT_FAILURE);
 	}));
 	Ok(())
 }
 
+/// This utility function returns a [`Future`] that completes upon
+/// receiving each of the default termination signals.
+///
+/// On Unix-based systems, these signals are Ctrl-C (SIGINT) or SIGTERM,
+/// and on Windows, they are Ctrl-C, Ctrl-Close, Ctrl-Shutdown.
+async fn user_signal() {
+	let ctrl_c = tokio::signal::ctrl_c();
+	#[cfg(all(unix, not(windows)))]
+	{
+		let sig = async {
+			let mut os_sig =
+				tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+			os_sig.recv().await;
+			std::io::Result::Ok(())
+		};
+
+		tokio::select! {
+			_ = ctrl_c => {},
+			_ = sig => {}
+		}
+	}
+
+	#[cfg(all(not(unix), windows))]
+	{
+		let ctrl_close = async {
+			let mut sig = tokio::signal::windows::ctrl_close()?;
+			sig.recv().await;
+			std::io::Result::Ok(())
+		};
+		let ctrl_shutdown = async {
+			let mut sig = tokio::signal::windows::ctrl_shutdown()?;
+			sig.recv().await;
+			std::io::Result::Ok(())
+		};
+		tokio::select! {
+			_ = ctrl_c => {},
+			_ = ctrl_close => {},
+			_ = ctrl_shutdown => {},
+		}
+	}
+}
+
 #[tokio::main]
 pub async fn main() -> Result<()> {
-	install_panic_hooks()?;
+	let shutdown = Controller::new();
 
-	let (error_sender, mut error_receiver) = channel::<Report>(1);
+	// install custom panic hooks
+	install_panic_hooks(shutdown.clone())?;
 
-	if let Err(error) = run(error_sender).await {
+	// spawn a task to watch for ctrl-c signals from user to trigger the shutdown
+	tokio::spawn(shutdown.with_trigger("user signaled shutdown".to_string(), user_signal()));
+
+	if let Err(error) = run(shutdown.clone()).await {
 		error!("{error:#}");
-		return Err(error);
+		return Err(error.wrap_err("Starting Light Client failed"));
 	};
 
-	let error = match error_receiver.recv().await {
-		Some(error) => error,
-		None => eyre!("Failed to receive error message"),
-	};
+	let reason = shutdown.completed_shutdown().await;
 
-	// We are not logging error here since expectation is
+	// we are not logging error here since expectation is
 	// to log terminating condition before sending message to this channel
-	Err(error)
+	Err(eyre!(reason).wrap_err("Running Light Client encountered an error"))
 }

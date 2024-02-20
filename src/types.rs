@@ -1,5 +1,6 @@
 //! Shared light client structs and enums.
 
+use crate::network::p2p::MemoryStoreConfig;
 use crate::network::rpc::{Event, Node as RpcNode};
 use crate::utils::{extract_app_lookup, extract_kate};
 use avail_core::DataLookup;
@@ -22,17 +23,22 @@ use sp_core::crypto::Ss58Codec;
 use sp_core::{blake2_256, bytes, ed25519};
 use std::fmt::{self, Display, Formatter};
 use std::fs;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU8, NonZeroUsize};
 use std::ops::Range;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use subxt::ext::sp_core::{sr25519::Pair, Pair as _};
 use tokio::sync::broadcast;
-use tokio::sync::mpsc::Sender;
+use tokio_retry::strategy::{jitter, ExponentialBackoff, FibonacciBackoff};
 
 const CELL_SIZE: usize = 32;
 const PROOF_SIZE: usize = 48;
 pub const CELL_WITH_PROOF_SIZE: usize = CELL_SIZE + PROOF_SIZE;
+
+pub const DEV_FLAG_GENHASH: &str = "DEV";
+pub const IDENTITY_PROTOCOL: &str = "/avail_kad/id/1.0.0";
+pub const IDENTITY_AGENT_BASE: &str = "avail-light-client";
+pub const IDENTITY_AGENT_CLIENT_TYPE: &str = "rust-client";
 
 #[derive(Parser)]
 #[command(version)]
@@ -52,6 +58,9 @@ pub struct CliOpts {
 	/// Run a clean light client, deleting existing avail_path folder
 	#[arg(long)]
 	pub clean: bool,
+	/// Enable finality sync
+	#[arg(short, long, value_name = "finality_sync_enable")]
+	pub finality_sync_enable: bool,
 	/// P2P port
 	#[arg(short, long)]
 	pub port: Option<u16>,
@@ -89,7 +98,6 @@ pub struct BlockVerified {
 pub struct ClientChannels {
 	pub block_sender: broadcast::Sender<BlockVerified>,
 	pub rpc_event_receiver: broadcast::Receiver<Event>,
-	pub error_sender: Sender<Report>,
 }
 
 impl TryFrom<(DaHeader, Option<f64>)> for BlockVerified {
@@ -113,16 +121,16 @@ impl TryFrom<(DaHeader, Option<f64>)> for BlockVerified {
 	}
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 #[serde(try_from = "String")]
 pub enum KademliaMode {
 	Client,
 	Server,
 }
 
-impl KademliaMode {
-	pub fn to_kad_mode(self) -> KadMode {
-		match self {
+impl From<KademliaMode> for KadMode {
+	fn from(value: KademliaMode) -> Self {
+		match value {
 			KademliaMode::Client => KadMode::Client,
 			KademliaMode::Server => KadMode::Server,
 		}
@@ -254,8 +262,56 @@ pub enum SecretKey {
 	Key { key: String },
 }
 
-/// Representation of a configuration used by this project.
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
+pub enum RetryConfig {
+	#[serde(rename = "exponential")]
+	Exponential(ExponentialConfig),
+
+	#[serde(rename = "fibonacci")]
+	Fibonacci(FibonacciConfig),
+}
+
+impl IntoIterator for RetryConfig {
+	type Item = Duration;
+	type IntoIter = std::vec::IntoIter<Self::Item>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		match self {
+			RetryConfig::Exponential(config) => ExponentialBackoff::from_millis(config.base)
+				.factor(1000)
+				.max_delay(Duration::from_millis(config.max_delay))
+				.map(jitter)
+				.take(config.retries)
+				.collect::<Vec<Duration>>()
+				.into_iter(),
+			RetryConfig::Fibonacci(config) => FibonacciBackoff::from_millis(config.base)
+				.factor(1000)
+				.max_delay(Duration::from_millis(config.max_delay))
+				.map(jitter)
+				.take(config.retries)
+				.collect::<Vec<Duration>>()
+				.into_iter(),
+		}
+	}
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ExponentialConfig {
+	pub base: u64,
+	pub max_delay: u64,
+	pub retries: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FibonacciConfig {
+	pub base: u64,
+	pub max_delay: u64,
+	pub retries: usize,
+}
+
+/// Representation of a configuration used by this project.
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct RuntimeConfig {
 	/// Light client HTTP server host name (default: 127.0.0.1).
@@ -279,10 +335,6 @@ pub struct RuntimeConfig {
 	pub autonat_refresh_interval: u64,
 	/// AutoNat on init delay before starting the fist probe. (default: 5 sec)
 	pub autonat_boot_delay: u64,
-	/// Sets application-specific version of the protocol family used by the peer. (default: "/avail_kad/id/1.0.0")
-	pub identify_protocol: String,
-	/// Sets agent version that is sent to peers. (default: "avail-light-client/rust-client")
-	pub identify_agent: String,
 	/// Vector of Light Client bootstrap nodes, used to bootstrap DHT. If not set, light client acts as a bootstrap node, waiting for first peer to connect for DHT bootstrap (default: empty).
 	pub bootstraps: Vec<MultiaddrConfig>,
 	/// Defines a period of time in which periodic bootstraps will be repeated. (default: 300 sec)
@@ -292,6 +344,8 @@ pub struct RuntimeConfig {
 	pub relays: Vec<MultiaddrConfig>,
 	/// WebSocket endpoint of full node for subscribing to latest header, etc (default: [ws://127.0.0.1:9944]).
 	pub full_node_ws: Vec<String>,
+	/// Genesis hash of the network to be connected to. Set to a string beginning with "DEV" to connect to any network.
+	pub genesis_hash: String,
 	/// ID of application used to start application client. If app_id is not set, or set to 0, application client is not started (default: 0).
 	pub app_id: Option<u32>,
 	/// Confidence threshold, used to calculate how many cells need to be sampled to achieve desired confidence (default: 92.0).
@@ -345,6 +399,10 @@ pub struct RuntimeConfig {
 	/// Sets the amount of time to keep connections alive when they're idle. (default: 30s).
 	/// NOTE: libp2p default value is 10s, but because of Avail block time of 20s the value has been increased
 	pub connection_idle_timeout: u64,
+	pub max_negotiating_inbound_streams: usize,
+	pub task_command_buffer_size: usize,
+	pub per_connection_event_buffer_size: usize,
+	pub dial_concurrency_factor: u8,
 	/// Sets the timeout for a single Kademlia query. (default: 60s).
 	pub query_timeout: u32,
 	/// Sets the allowed level of parallelism for iterative Kademlia queries. (default: 3).
@@ -362,6 +420,14 @@ pub struct RuntimeConfig {
 	pub max_kad_record_size: u64,
 	/// The maximum number of provider records for which the local node is the provider. (default: 1024).
 	pub max_kad_provided_keys: u64,
+	/// Set the configuration based on which the retries will be orchestrated, max duration [in seconds] between retries and number of tries.
+	/// (default:
+	/// fibonacci:
+	///     base: 1,
+	///     max_delay: 10,
+	///     retries: 6,
+	/// )
+	pub retry_config: RetryConfig,
 	#[cfg(feature = "crawl")]
 	#[serde(flatten)]
 	pub crawl: crate::crawl_client::CrawlConfig,
@@ -412,7 +478,6 @@ pub struct FatClientConfig {
 	pub block_processing_delay: Delay,
 	pub block_matrix_partition: Option<Partition>,
 	pub max_cells_per_rpc: usize,
-	pub ttl: u64,
 }
 
 impl From<&RuntimeConfig> for FatClientConfig {
@@ -430,11 +495,11 @@ impl From<&RuntimeConfig> for FatClientConfig {
 			block_processing_delay: Delay(block_processing_delay),
 			block_matrix_partition: val.block_matrix_partition,
 			max_cells_per_rpc: val.max_cells_per_rpc.unwrap_or(30),
-			ttl: val.kad_record_ttl,
 		}
 	}
 }
 
+#[derive(Clone)]
 pub struct LibP2PConfig {
 	pub secret_key: Option<SecretKey>,
 	pub port: u16,
@@ -444,7 +509,46 @@ pub struct LibP2PConfig {
 	pub relays: Vec<(PeerId, Multiaddr)>,
 	pub bootstrap_interval: Duration,
 	pub connection_idle_timeout: Duration,
-	pub kademlia_mode: KademliaMode,
+	pub max_negotiating_inbound_streams: usize,
+	pub task_command_buffer_size: NonZeroUsize,
+	pub per_connection_event_buffer_size: usize,
+	pub dial_concurrency_factor: NonZeroU8,
+}
+
+impl From<&LibP2PConfig> for libp2p::kad::Config {
+	fn from(cfg: &LibP2PConfig) -> Self {
+		// Use identify protocol_version as Kademlia protocol name
+		let kademlia_protocol_name =
+			libp2p::StreamProtocol::try_from_owned(cfg.identify.protocol_version.clone())
+				.expect("Invalid Kademlia protocol name");
+
+		// create Kademlia Config
+		let mut kad_cfg = libp2p::kad::Config::default();
+		kad_cfg
+			.set_publication_interval(cfg.kademlia.publication_interval)
+			.set_replication_interval(cfg.kademlia.record_replication_interval)
+			.set_replication_factor(cfg.kademlia.record_replication_factor)
+			.set_query_timeout(cfg.kademlia.query_timeout)
+			.set_parallelism(cfg.kademlia.query_parallelism)
+			.set_caching(libp2p::kad::Caching::Enabled {
+				max_peers: cfg.kademlia.caching_max_peers,
+			})
+			.disjoint_query_paths(cfg.kademlia.disjoint_query_paths)
+			.set_record_filtering(libp2p::kad::StoreInserts::FilterBoth)
+			.set_protocol_names(vec![kademlia_protocol_name]);
+		kad_cfg
+	}
+}
+
+impl From<&LibP2PConfig> for MemoryStoreConfig {
+	fn from(cfg: &LibP2PConfig) -> Self {
+		MemoryStoreConfig {
+			max_records: cfg.kademlia.max_kad_record_number, // ~2hrs
+			max_value_bytes: cfg.kademlia.max_kad_record_size + 1,
+			max_providers_per_key: usize::from(cfg.kademlia.record_replication_factor), // Needs to match the replication factor, per libp2p docs
+			max_provided_keys: cfg.kademlia.max_kad_provided_keys,
+		}
+	}
 }
 
 impl From<&RuntimeConfig> for LibP2PConfig {
@@ -458,14 +562,19 @@ impl From<&RuntimeConfig> for LibP2PConfig {
 			relays: val.relays.iter().map(Into::into).collect(),
 			bootstrap_interval: Duration::from_secs(val.bootstrap_period),
 			connection_idle_timeout: Duration::from_secs(val.connection_idle_timeout),
-			kademlia_mode: val.operation_mode,
+			max_negotiating_inbound_streams: val.max_negotiating_inbound_streams,
+			task_command_buffer_size: std::num::NonZeroUsize::new(val.task_command_buffer_size)
+				.expect("Invalid task command buffer size"),
+			per_connection_event_buffer_size: val.per_connection_event_buffer_size,
+			dial_concurrency_factor: std::num::NonZeroU8::new(val.dial_concurrency_factor)
+				.expect("Invalid dial concurrency factor"),
 		}
 	}
 }
 
 /// Kademlia configuration (see [RuntimeConfig] for details)
+#[derive(Clone)]
 pub struct KademliaConfig {
-	pub record_ttl: u64,
 	pub record_replication_factor: NonZeroUsize,
 	pub record_replication_interval: Option<Duration>,
 	pub publication_interval: Option<Duration>,
@@ -476,12 +585,12 @@ pub struct KademliaConfig {
 	pub max_kad_record_number: usize,
 	pub max_kad_record_size: usize,
 	pub max_kad_provided_keys: usize,
+	pub kademlia_mode: KademliaMode,
 }
 
 impl From<&RuntimeConfig> for KademliaConfig {
 	fn from(val: &RuntimeConfig) -> Self {
 		Self {
-			record_ttl: val.kad_record_ttl,
 			record_replication_factor: std::num::NonZeroUsize::new(val.replication_factor as usize)
 				.expect("Invalid replication factor"),
 			record_replication_interval: Some(Duration::from_secs(val.replication_interval.into())),
@@ -494,11 +603,13 @@ impl From<&RuntimeConfig> for KademliaConfig {
 			max_kad_record_number: val.max_kad_record_number as usize,
 			max_kad_record_size: val.max_kad_record_size as usize,
 			max_kad_provided_keys: val.max_kad_provided_keys as usize,
+			kademlia_mode: val.operation_mode,
 		}
 	}
 }
 
 /// Libp2p AutoNAT configuration (see [RuntimeConfig] for details)
+#[derive(Clone)]
 pub struct AutoNATConfig {
 	pub retry_interval: Duration,
 	pub refresh_interval: Duration,
@@ -519,16 +630,73 @@ impl From<&RuntimeConfig> for AutoNATConfig {
 	}
 }
 
+#[derive(Clone)]
 pub struct IdentifyConfig {
-	pub agent_version: String,
+	pub agent_version: AgentVersion,
+	/// Contains Avail genesis hash
 	pub protocol_version: String,
+}
+
+#[derive(Clone)]
+pub struct AgentVersion {
+	pub base_version: String,
+	pub client_type: String,
+	// Kademlia client or server mode
+	pub kademlia_mode: String,
+}
+
+impl fmt::Display for AgentVersion {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"{}/{}/{}",
+			self.base_version, self.client_type, self.kademlia_mode
+		)
+	}
+}
+
+impl FromStr for AgentVersion {
+	type Err = String;
+
+	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+		let parts: Vec<&str> = s.split('/').collect();
+		if parts.len() != 3 {
+			return Err("Failed to parse agent version".to_owned());
+		}
+
+		Ok(AgentVersion {
+			base_version: parts[0].to_string(),
+			client_type: parts[1].to_string(),
+			kademlia_mode: parts[2].to_string(),
+		})
+	}
 }
 
 impl From<&RuntimeConfig> for IdentifyConfig {
 	fn from(val: &RuntimeConfig) -> Self {
+		let mut genhash_short = val.genesis_hash.trim_start_matches("0x").to_string();
+		genhash_short.truncate(6);
+
+		let kademlia_mode = if val.is_fat_client() {
+			// Fat client is implicitly server mode
+			KademliaMode::Server.to_string()
+		} else {
+			val.operation_mode.to_string()
+		};
+
+		let agent_version = AgentVersion {
+			base_version: IDENTITY_AGENT_BASE.to_string(),
+			client_type: IDENTITY_AGENT_CLIENT_TYPE.to_string(),
+			kademlia_mode,
+		};
+
 		Self {
-			agent_version: val.identify_agent.clone(),
-			protocol_version: val.identify_protocol.clone(),
+			agent_version,
+			protocol_version: format!(
+				"{id}-{gen_hash}",
+				id = IDENTITY_PROTOCOL,
+				gen_hash = genhash_short
+			),
 		}
 	}
 }
@@ -539,7 +707,6 @@ pub struct SyncClientConfig {
 	pub confidence: f64,
 	pub disable_rpc: bool,
 	pub dht_parallelization_limit: usize,
-	pub ttl: u64,
 	pub is_last_step: bool,
 }
 
@@ -549,7 +716,6 @@ impl From<&RuntimeConfig> for SyncClientConfig {
 			confidence: val.confidence,
 			disable_rpc: val.disable_rpc,
 			dht_parallelization_limit: val.dht_parallelization_limit,
-			ttl: val.kad_record_ttl,
 			is_last_step: val.app_id.is_none(),
 		}
 	}
@@ -583,12 +749,11 @@ impl Default for RuntimeConfig {
 			autonat_retry_interval: 20,
 			autonat_throttle: 1,
 			autonat_boot_delay: 5,
-			identify_protocol: "/avail_kad/id/1.0.0".to_string(),
-			identify_agent: "avail-light-client/rust-client".to_string(),
 			bootstraps: vec![],
 			bootstrap_period: 3600,
 			relays: Vec::new(),
 			full_node_ws: vec!["ws://127.0.0.1:9944".to_owned()],
+			genesis_hash: "DEV".to_owned(),
 			app_id: None,
 			confidence: 99.9,
 			avail_path: "avail_path".to_owned(),
@@ -598,10 +763,10 @@ impl Default for RuntimeConfig {
 			disable_rpc: false,
 			dht_parallelization_limit: 20,
 			query_proof_rpc_parallel_tasks: 8,
-			block_processing_delay: Some(10),
+			block_processing_delay: Some(20),
 			block_matrix_partition: None,
 			sync_start_block: None,
-			sync_finality_enable: true,
+			sync_finality_enable: false,
 			max_cells_per_rpc: Some(30),
 			kad_record_ttl: 24 * 60 * 60,
 			threshold: 5000,
@@ -609,6 +774,10 @@ impl Default for RuntimeConfig {
 			publication_interval: 12 * 60 * 60,
 			replication_interval: 3 * 60 * 60,
 			connection_idle_timeout: 30,
+			max_negotiating_inbound_streams: 128,
+			task_command_buffer_size: 32,
+			per_connection_event_buffer_size: 7,
+			dial_concurrency_factor: 8,
 			query_timeout: 10,
 			query_parallelism: 3,
 			caching_max_peers: 1,
@@ -619,7 +788,12 @@ impl Default for RuntimeConfig {
 			#[cfg(feature = "crawl")]
 			crawl: crate::crawl_client::CrawlConfig::default(),
 			origin: "external".to_string(),
-			operation_mode: KademliaMode::Server,
+			operation_mode: KademliaMode::Client,
+			retry_config: RetryConfig::Exponential(ExponentialConfig {
+				base: 10,
+				max_delay: 4000,
+				retries: 3,
+			}),
 		}
 	}
 }
@@ -652,10 +826,8 @@ impl Network {
 
 	fn multiaddr(&self) -> &str {
 		match self {
-			Network::Local => "/ip4/127.0.0.1/udp/39000/quic-v1",
-			Network::Goldberg => {
-				"/dns/bootnode.1.lightclient.goldberg.avail.tools/udp/37000/quic-v1"
-			},
+			Network::Local => "/ip4/127.0.0.1/tcp/39000",
+			Network::Goldberg => "/dns/bootnode.1.lightclient.goldberg.avail.tools/tcp/37000",
 		}
 	}
 
@@ -670,6 +842,13 @@ impl Network {
 		match self {
 			Network::Local => "http://127.0.0.1:4317",
 			Network::Goldberg => "http://otel.lightclient.goldberg.avail.tools:4317",
+		}
+	}
+
+	fn genesis_hash(&self) -> &str {
+		match self {
+			Network::Local => "DEV",
+			Network::Goldberg => "6f09966420b2608d1947ccfb0f2a362450d1fc7fd902c29b67c906eaa965a7ae",
 		}
 	}
 }
@@ -736,6 +915,7 @@ impl RuntimeConfig {
 			self.full_node_ws = vec![network.full_node_ws().to_string()];
 			self.bootstraps = vec![MultiaddrConfig::PeerIdAndMultiaddr(bootstrap)];
 			self.ot_collector_endpoint = network.ot_collector_endpoint().to_string();
+			self.genesis_hash = network.genesis_hash().to_string();
 		}
 
 		if let Some(loglvl) = &opts.verbosity {
@@ -745,7 +925,7 @@ impl RuntimeConfig {
 		if let Some(port) = opts.port {
 			self.port = port;
 		}
-
+		self.sync_finality_enable = opts.finality_sync_enable;
 		self.app_id = opts.app_id.or(self.app_id);
 
 		Ok(())
